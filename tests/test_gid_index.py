@@ -35,8 +35,8 @@ _SPARK_PORT = {
 }
 
 
-def _make_port(root, entries, *, hca=_HCA):
-    port = root / hca / "ports" / "1"
+def _make_port(root, entries, *, hca=_HCA, port_num="1"):
+    port = root / hca / "ports" / str(port_num)
     (port / "gid_attrs" / "types").mkdir(parents=True)
     (port / "gids").mkdir(parents=True)
     for idx, (gid_type, gid) in entries.items():
@@ -56,7 +56,16 @@ def bin_dir(tmp_path):
     d = tmp_path / "bin"
     d.mkdir()
     for tool in ("ls", "sort", "cat"):
-        os.symlink(shutil.which(tool), d / tool)
+        source = shutil.which(tool)
+        if os.name == "nt":
+            os.link(source, d / (tool + ".exe"))
+        else:
+            os.symlink(source, d / tool)
+    # Shadow any host-installed show_gids, while retaining the original bin
+    # path for DLL dependencies of the hard-linked Windows executables.
+    stub = d / "show_gids"
+    stub.write_text("#!/bin/sh\nexit 1\n")
+    stub.chmod(0o755)
     return d
 
 
@@ -66,14 +75,15 @@ def _stub_show_gids(bin_dir, output):
     stub.chmod(0o755)
 
 
-def _run(bin_dir, hca_dir, hca=_HCA):
-    script = read_script("_gid_index.sh") + '\nsparkrun_rocev2_gid_index "$1" "$2"\n'
+def _run(bin_dir, hca_dir, hca=_HCA, port_num="1"):
+    script = read_script("_gid_index.sh") + '\nsparkrun_rocev2_gid_index "$1" "$2" "$3"\n'
+    tool_path = os.pathsep.join((str(bin_dir), os.path.dirname(shutil.which("bash"))))
     result = subprocess.run(
-        [shutil.which("bash"), "-s", "--", hca, str(hca_dir)],
+        [shutil.which("bash"), "-s", "--", hca, str(hca_dir), str(port_num)],
         input=script,
         capture_output=True,
         text=True,
-        env={"PATH": str(bin_dir)},
+        env={"PATH": tool_path},
         check=True,
     )
     return result.stdout.strip(), result.stderr
@@ -85,6 +95,45 @@ def test_sysfs_prefers_ipv4_gid_over_link_local(tmp_path, bin_dir):
     idx, err = _run(bin_dir, hca_dir)
     assert idx == "3"
     assert "via sysfs" in err
+
+
+def test_sysfs_selects_ipv4_gid_from_requested_port(tmp_path, bin_dir):
+    hca_dir = _make_port(tmp_path / "ib", _SPARK_PORT, port_num="2")
+
+    idx, err = _run(bin_dir, hca_dir, port_num="2")
+
+    assert idx == "3"
+    assert "via sysfs" in err
+
+
+def test_ib_detect_reports_port2_when_port1_is_down(tmp_path, bin_dir):
+    hca_dir = tmp_path / "sys" / "class" / "infiniband" / _HCA
+    port1 = hca_dir / "ports" / "1"
+    port1.mkdir(parents=True)
+    (port1 / "state").write_text("4: DOWN\n")
+    port2 = _make_port(tmp_path / "sys" / "class" / "infiniband", _SPARK_PORT, port_num="2") / "ports" / "2"
+    (port2 / "state").write_text("4: ACTIVE\n")
+    netdev = hca_dir / "device" / "net" / "cx7_1"
+    netdev.mkdir(parents=True)
+    net_sysfs = tmp_path / "net"
+    net_sysfs.mkdir()
+
+    script = generate_ib_detect_script().replace("/sys/class/infiniband", hca_dir.parent.as_posix())
+    result = subprocess.run(
+        [shutil.which("bash"), "-s"],
+        input=script,
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": os.pathsep.join((str(bin_dir), os.path.dirname(shutil.which("bash")))),
+            "SPARKRUN_NET_SYSFS": net_sysfs.as_posix(),
+        },
+        check=True,
+    )
+
+    assert "IB_DETECTED=1" in result.stdout
+    assert f"DETECTED_HCA_LIST={_HCA}:2" in result.stdout
+    assert "DETECTED_UCX_LIST=" + _HCA + ":2" in result.stdout
 
 
 def test_no_ipv4_gid_defers_to_nccl(tmp_path, bin_dir):
@@ -154,6 +203,8 @@ def test_helper_is_brace_free():
 
 @pytest.mark.parametrize("script", [generate_ib_detect_script(), generate_combined_probe_script()], ids=["ib_detect", "probe"])
 def test_both_detectors_use_the_shared_helper(script):
-    assert 'GID_INDEX=$(sparkrun_rocev2_gid_index "$hca_name" "$ib_path")' in script
+    assert 'for port_path in "$ib_path"/ports/*' in script
+    assert 'GID_INDEX=$(sparkrun_rocev2_gid_index "$hca_name" "$ib_path" "$port_num")' in script
+    assert "DETECTED_HCA_LIST_EXACT=1" in script
     assert "defaulting to 3" not in script
     assert subprocess.run([shutil.which("bash"), "-n"], input=script, text=True).returncode == 0

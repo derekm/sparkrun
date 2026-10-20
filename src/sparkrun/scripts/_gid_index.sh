@@ -31,13 +31,18 @@
 #   "read" instead) and the braced function-body syntax, which is why the
 #   function is defined with a ( subshell ) body.
 #
-# Usage: IDX=$(sparkrun_rocev2_gid_index "<hca name>" "<hca sysfs dir>")
+# Usage: IDX=$(sparkrun_rocev2_gid_index "<hca name>" "<hca sysfs dir>" "<port>")
 #
 # Always prints an index.  Diagnostics go to stderr.
 sparkrun_rocev2_gid_index() (
     set +u
     _hca="$1"
-    _port="$2/ports/1"
+    if [ -n "$3" ]; then
+        _port_num="$3"
+    else
+        _port_num=1
+    fi
+    _port="$2/ports/$_port_num"
 
     if command -v show_gids >/dev/null 2>&1; then
         # Columns: DEV PORT INDEX GID IPv4 VER DEV.  A row without an IPv4
@@ -45,7 +50,7 @@ sparkrun_rocev2_gid_index() (
         # netdev name lands in _ver and the row fails the v2 test -- the same
         # field shift the original awk match relied on.
         _idx=$(show_gids 2>/dev/null | while read -r _dev _p _i _gid _ipv4 _ver _rest; do
-            if [ "$_dev" = "$_hca" ] && [ "$_ver" = "v2" ]; then
+            if [ "$_dev" = "$_hca" ] && [ "$_p" = "$_port_num" ] && [ "$_ver" = "v2" ]; then
                 case "$_ipv4" in
                     [0-9]*.[0-9]*.[0-9]*.[0-9]*) echo "$_i"; break ;;
                 esac

@@ -28,31 +28,37 @@ for ib_path in /sys/class/infiniband/*; do
     [ -e "$ib_path" ] || continue
     hca_name=$(basename "$ib_path")
 
-    # Check Port 1 state
-    state_file="$ib_path/ports/1/state"
-    if [ ! -f "$state_file" ]; then continue; fi
+    # Inspect every port; multi-port HCAs can have a usable fabric only on
+    # port 2 (or later), even when port 1 is down.
+    for port_path in "$ib_path"/ports/*; do
+        [ -d "$port_path" ] || continue
+        port_num=$(basename "$port_path")
+        state_file="$port_path/state"
+        [ -f "$state_file" ] || continue
+        state_val=$(cat "$state_file" 2>/dev/null)
 
-    state_val=$(cat "$state_file" 2>/dev/null)
+        if [[ "$state_val" == *"ACTIVE"* ]]; then
+            ACTIVE_HCAS+=("$hca_name:$port_num")
+            UCX_DEVS+=("${hca_name}:${port_num}")
 
-    if [[ "$state_val" == *"ACTIVE"* ]]; then
-        ACTIVE_HCAS+=("$hca_name")
-        UCX_DEVS+=("${hca_name}:1")
+            # Determine GID Index (run once on first active port). Always
+            # yields an index; -1 hands the choice to NCCL.
+            if [ -z "$GID_INDEX" ]; then
+                GID_INDEX=$(sparkrun_rocev2_gid_index "$hca_name" "$ib_path" "$port_num")
+            else
+                echo "Device $hca_name port $port_num: Active" >&2
+            fi
 
-        # Determine GID Index (run once on first active card).  Always
-        # yields an index; -1 hands the choice to NCCL.  See _gid_index.sh.
-        if [ -z "$GID_INDEX" ]; then
-            GID_INDEX=$(sparkrun_rocev2_gid_index "$hca_name" "$ib_path")
-        else
-            echo "Device $hca_name: Active" >&2
+            # Find Ethernet interface backing this device, without duplicates.
+            net_dir="$ib_path/device/net"
+            if [ -d "$net_dir" ]; then
+                net_if=$(ls "$net_dir" | head -n 1)
+                if [ -n "$net_if" ] && [[ " ${ACTIVE_NETIFS[*]} " != *" $net_if "* ]]; then
+                    ACTIVE_NETIFS+=("$net_if")
+                fi
+            fi
         fi
-
-        # Find Ethernet interface backing this device
-        net_dir="$ib_path/device/net"
-        if [ -d "$net_dir" ]; then
-            net_if=$(ls "$net_dir" | head -n 1)
-            [ -n "$net_if" ] && ACTIVE_NETIFS+=("$net_if")
-        fi
-    fi
+    done
 done
 
 if [ ${#ACTIVE_HCAS[@]} -eq 0 ]; then
@@ -100,6 +106,7 @@ echo "---------------------------------------------------" >&2
 echo "IB_DETECTED=1"
 echo "DETECTED_GID_INDEX=$GID_INDEX"
 echo "DETECTED_HCA_LIST=$HCA_LIST"
+echo "DETECTED_HCA_LIST_EXACT=1"
 echo "DETECTED_SOCKET_IFNAME=$DEFAULT_IF"
 echo "DETECTED_NET_LIST=$NET_LIST"
 echo "DETECTED_UCX_LIST=$UCX_LIST"

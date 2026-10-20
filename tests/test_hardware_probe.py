@@ -245,6 +245,49 @@ def test_probe_hosts_parallel(monkeypatch):
         assert hw.ib_info["IB_DETECTED"] == "1"
 
 
+def test_probe_hosts_applies_route_matched_gid_per_host(monkeypatch):
+    hosts = ["head", "worker"]
+    ib_by_host = {
+        "head": _IB_DETECTED.replace("192.168.1.10", "10.0.0.1"),
+        "worker": _IB_DETECTED.replace("192.168.1.10", "10.0.0.2"),
+    }
+    route_by_host = {
+        "head": "ROCE_ROUTE=10.0.0.2|10.0.0.1|cx7_1|mlx5_1|1|3|0000:0000:0000:0000:0000:ffff:0a00:0001\n",
+        "worker": "ROCE_ROUTE=10.0.0.1|10.0.0.2|cx7_0|mlx5_0|1|2|0000:0000:0000:0000:0000:ffff:0a00:0002\n",
+    }
+    route_calls = {}
+    route_kwargs = {}
+
+    def _fake_parallel(host_list, script, timeout=None, **kwargs):
+        if "ip -o -4 route get" in script:
+            host = host_list[0]
+            route_calls[host] = script
+            route_kwargs[host] = kwargs
+            return [RemoteResult(host=host, returncode=0, stdout=route_by_host[host], stderr="")]
+        return [
+            RemoteResult(
+                host=host,
+                returncode=0,
+                stdout=_combined(_ACCEL_DGX, ib_by_host[host]),
+                stderr="",
+            )
+            for host in host_list
+        ]
+
+    monkeypatch.setattr("sparkrun.orchestration.ssh.run_remote_scripts_parallel", _fake_parallel)
+
+    result = probe_hosts(hosts)
+
+    assert set(route_calls) == set(hosts)
+    assert all(route_kwargs[host].get("allow_local") is True for host in hosts)
+    assert "SPARKRUN_PEER_IPS=10.0.0.2" in route_calls["head"]
+    assert "SPARKRUN_PEER_IPS=10.0.0.1" in route_calls["worker"]
+    assert result["head"].ib_info["DETECTED_GID_INDEX"] == "3"
+    assert result["head"].ib_info["DETECTED_HCA_LIST"] == "mlx5_1:1"
+    assert result["worker"].ib_info["DETECTED_GID_INDEX"] == "2"
+    assert result["worker"].ib_info["DETECTED_HCA_LIST"] == "mlx5_0:1"
+
+
 def test_probe_hosts_dry_run():
     """dry_run returns a placeholder HostHardware per host, no SSH."""
     hosts = ["node-1", "node-2"]
@@ -293,4 +336,7 @@ def test_combined_probe_management_pin_reaches_single_and_parallel_ssh(monkeypat
     )
     probe_host("h1", mgmt_interface="mgmt0")
     probe_hosts(["h1", "h2"], mgmt_interface="mgmt0")
-    assert scripts == [generate_combined_probe_script("mgmt0")] * 3
+    assert scripts.count(generate_combined_probe_script("mgmt0")) == 3
+    route_scripts = [script for script in scripts if "ROCE_ROUTE=" in script]
+    assert len(route_scripts) == 2
+    assert all("SPARKRUN_PEER_IPS=192.168.1.10" in script for script in route_scripts)

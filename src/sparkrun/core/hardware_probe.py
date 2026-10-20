@@ -170,27 +170,32 @@ for ib_path in /sys/class/infiniband/*; do
     [ -e "$ib_path" ] || continue
     hca_name=$(basename "$ib_path")
 
-    state_file="$ib_path/ports/1/state"
-    if [ ! -f "$state_file" ]; then continue; fi
+    for port_path in "$ib_path"/ports/*; do
+        [ -d "$port_path" ] || continue
+        port_num=$(basename "$port_path")
+        state_file="$port_path/state"
+        [ -f "$state_file" ] || continue
+        state_val=$(cat "$state_file" 2>/dev/null)
 
-    state_val=$(cat "$state_file" 2>/dev/null)
+        if [[ "$state_val" == *"ACTIVE"* ]]; then
+            ACTIVE_HCAS+=("$hca_name:$port_num")
+            UCX_DEVS+=("${{hca_name}}:${{port_num}}")
 
-    if [[ "$state_val" == *"ACTIVE"* ]]; then
-        ACTIVE_HCAS+=("$hca_name")
-        UCX_DEVS+=("${{hca_name}}:1")
+            if [ -z "$GID_INDEX" ]; then
+                GID_INDEX=$(sparkrun_rocev2_gid_index "$hca_name" "$ib_path" "$port_num")
+            else
+                echo "Device $hca_name port $port_num: Active" >&2
+            fi
 
-        if [ -z "$GID_INDEX" ]; then
-            GID_INDEX=$(sparkrun_rocev2_gid_index "$hca_name" "$ib_path")
-        else
-            echo "Device $hca_name: Active" >&2
+            net_dir="$ib_path/device/net"
+            if [ -d "$net_dir" ]; then
+                net_if=$(ls "$net_dir" | head -n 1)
+                if [ -n "$net_if" ] && [[ " ${{ACTIVE_NETIFS[*]}} " != *" $net_if "* ]]; then
+                    ACTIVE_NETIFS+=("$net_if")
+                fi
+            fi
         fi
-
-        net_dir="$ib_path/device/net"
-        if [ -d "$net_dir" ]; then
-            net_if=$(ls "$net_dir" | head -n 1)
-            [ -n "$net_if" ] && ACTIVE_NETIFS+=("$net_if")
-        fi
-    fi
+    done
 done
 
 if [ ${{#ACTIVE_HCAS[@]}} -eq 0 ]; then
@@ -224,6 +229,7 @@ IB_IP_LIST=$(IFS=,; echo "${{IB_IPS[*]}}")
 echo "IB_DETECTED=1"
 echo "DETECTED_GID_INDEX=$GID_INDEX"
 echo "DETECTED_HCA_LIST=$HCA_LIST"
+echo "DETECTED_HCA_LIST_EXACT=1"
 echo "DETECTED_SOCKET_IFNAME=$DEFAULT_IF"
 echo "DETECTED_NET_LIST=$NET_LIST"
 echo "DETECTED_UCX_LIST=$UCX_LIST"
@@ -402,6 +408,15 @@ def probe_hosts(
             hardware[result.host] = HostHardware(notes="hardware probe failed: %s" % excerpt(result.stderr, 120))
         else:
             hardware[result.host] = _parse_probe_result(result.stdout)
+
+    ib_observations = {host: hw.ib_info for host, hw in hardware.items() if hw.ib_info is not None}
+    if len(hosts) > 1 and ib_observations:
+        from sparkrun.orchestration.infiniband import enrich_ib_observations_with_roce_routes
+
+        enriched = enrich_ib_observations_with_roce_routes(hosts, ib_observations, ssh_kwargs=kw, allow_local=True)
+        for host, ib_info in enriched.items():
+            if host in hardware:
+                hardware[host].ib_info = ib_info
 
     return hardware
 

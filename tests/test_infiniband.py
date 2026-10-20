@@ -1,13 +1,19 @@
 """Unit tests for sparkrun.orchestration.infiniband module."""
 
+import subprocess
 from unittest.mock import patch
 
 from sparkrun.orchestration.comm_env import ClusterCommEnv
 from sparkrun.orchestration.infiniband import (
+    apply_roce_route_info,
     generate_ib_detect_script,
+    generate_roce_route_probe_script,
     parse_ib_detect_output,
+    parse_roce_route_output,
     generate_nccl_env,
     generate_ring_nccl_overrides,
+    ib_detection_from_observations,
+    enrich_ib_observations_with_roce_routes,
     pin_comm_env_to_ib,
     validate_ib_connectivity,
 )
@@ -27,6 +33,14 @@ def test_generate_ib_detect_script_contains_key_checks():
     assert "show_gids" in script
     assert "/sys/class/infiniband" in script
     assert "IB_DETECTED" in script
+
+
+def test_generate_ib_detect_script_inventories_every_active_port():
+    script = generate_ib_detect_script()
+
+    assert 'for port_path in "$ib_path"/ports/*' in script
+    assert 'ACTIVE_HCAS+=("$hca_name:$port_num")' in script
+    assert 'sparkrun_rocev2_gid_index "$hca_name" "$ib_path" "$port_num"' in script
 
 
 def test_parse_ib_detect_output_with_ib():
@@ -77,6 +91,449 @@ DETECTED_GID_INDEX=0
     assert result["IB_DETECTED"] == "1"
     assert result["DETECTED_GID_INDEX"] == "0"
     assert len(result) == 2
+
+
+def test_roce_route_probe_targets_peer_and_checks_route_gid():
+    script = generate_roce_route_probe_script(["192.168.4.2"])
+
+    assert "SPARKRUN_PEER_IPS=192.168.4.2" in script
+    assert "ip -o -4 route get" in script
+    assert "RoCE v2" in script
+    assert "ROCE_ROUTE=" in script
+
+
+def test_roce_route_probe_uses_the_routed_hcas_matching_ipv4_gid():
+    # The first active HCA has only a link-local entry at index 1. The route
+    # to the peer uses cx7_1, whose exact IPv4-mapped RoCEv2 entry is index 3.
+    script = r"""
+set -euo pipefail
+fixture=$(mktemp -d)
+trap 'rm -rf "$fixture"' EXIT
+for hca in mlx5_0 mlx5_1; do
+    if [[ "$hca" == mlx5_0 ]]; then dev=cx7_0; else dev=cx7_1; fi
+    mkdir -p "$fixture/class/net/$dev/device/infiniband/$hca"
+    mkdir -p "$fixture/class/infiniband/$hca/ports/1/gids"
+    mkdir -p "$fixture/class/infiniband/$hca/ports/1/gid_attrs/types"
+    printf '%s\n' 'fe80:0000:0000:0000:0000:0000:0000:0001' > "$fixture/class/infiniband/$hca/ports/1/gids/1"
+    printf '%s\n' 'RoCE v2' > "$fixture/class/infiniband/$hca/ports/1/gid_attrs/types/1"
+done
+printf '%s\n' '0000:0000:0000:0000:0000:ffff:c0a8:0401' > "$fixture/class/infiniband/mlx5_1/ports/1/gids/3"
+printf '%s\n' 'RoCE v2' > "$fixture/class/infiniband/mlx5_1/ports/1/gid_attrs/types/3"
+SPARKRUN_SYSFS_ROOT="$fixture"
+ip() { printf '%s\n' '192.168.4.2 dev cx7_1 src 192.168.4.1 uid 1000'; }
+""" + generate_roce_route_probe_script(["192.168.4.2"])
+    result = subprocess.run(["bash", "-s"], input=script.encode(), capture_output=True, timeout=10)
+
+    assert result.returncode == 0, result.stderr.decode()
+    assert result.stdout.decode().strip() == (
+        "ROCE_ROUTE=192.168.4.2|192.168.4.1|cx7_1|mlx5_1|1|3|0000:0000:0000:0000:0000:ffff:c0a8:0401"
+    ), result.stderr.decode()
+
+
+def test_roce_route_probe_keeps_valid_rows_regardless_of_peer_order():
+    fixture = r"""
+set -euo pipefail
+sysfs=$(mktemp -d)
+trap 'rm -rf "$sysfs"' EXIT
+for hca in mlx5_0 mlx5_1; do
+    if [[ "$hca" == mlx5_0 ]]; then dev=cx7_0; else dev=cx7_1; fi
+    mkdir -p "$sysfs/class/net/$dev/device/infiniband/$hca"
+    mkdir -p "$sysfs/class/infiniband/$hca/ports/1/gids"
+    mkdir -p "$sysfs/class/infiniband/$hca/ports/1/gid_attrs/types"
+    printf '%s\n' 'fe80:0000:0000:0000:0000:0000:0000:0001' > "$sysfs/class/infiniband/$hca/ports/1/gids/1"
+    printf '%s\n' 'RoCE v2' > "$sysfs/class/infiniband/$hca/ports/1/gid_attrs/types/1"
+done
+printf '%s\n' '0000:0000:0000:0000:0000:ffff:0a00:0001' > "$sysfs/class/infiniband/mlx5_0/ports/1/gids/3"
+printf '%s\n' 'RoCE v2' > "$sysfs/class/infiniband/mlx5_0/ports/1/gid_attrs/types/3"
+SPARKRUN_SYSFS_ROOT="$sysfs"
+ip() {
+    case "$5" in
+        10.0.0.2) printf '%s\n' '10.0.0.2 dev cx7_0 src 10.0.0.1' ;;
+        10.0.1.2) printf '%s\n' '10.0.1.2 dev cx7_1 src 10.0.1.1' ;;
+    esac
+}
+"""
+    valid_route = "ROCE_ROUTE=10.0.0.2|10.0.0.1|cx7_0|mlx5_0|1|3|0000:0000:0000:0000:0000:ffff:0a00:0001"
+
+    for peers in (["10.0.0.2", "10.0.1.2"], ["10.0.1.2", "10.0.0.2"]):
+        script = fixture + generate_roce_route_probe_script(peers)
+        result = subprocess.run(["bash", "-s"], input=script.encode(), capture_output=True, timeout=10)
+        assert result.returncode == 0, result.stderr.decode()
+        assert result.stdout.decode().strip() == valid_route
+
+
+def test_roce_route_probe_emits_the_matching_hca_port():
+    fixture = r"""
+set -euo pipefail
+sysfs=$(mktemp -d)
+trap 'rm -rf "$sysfs"' EXIT
+mkdir -p "$sysfs/class/net/cx7_1/device/infiniband/mlx5_0"
+for port in 1 2; do
+    mkdir -p "$sysfs/class/infiniband/mlx5_0/ports/$port/gids"
+    mkdir -p "$sysfs/class/infiniband/mlx5_0/ports/$port/gid_attrs/types"
+    mkdir -p "$sysfs/class/infiniband/mlx5_0/ports/$port/gid_attrs/ndevs"
+done
+printf '%s\n' 'fe80:0000:0000:0000:0000:0000:0000:0001' > "$sysfs/class/infiniband/mlx5_0/ports/1/gids/1"
+printf '%s\n' 'RoCE v2' > "$sysfs/class/infiniband/mlx5_0/ports/1/gid_attrs/types/1"
+printf '%s\n' 'cx7_0' > "$sysfs/class/infiniband/mlx5_0/ports/1/gid_attrs/ndevs/1"
+printf '%s\n' '0000:0000:0000:0000:0000:ffff:0a00:0001' > "$sysfs/class/infiniband/mlx5_0/ports/2/gids/3"
+printf '%s\n' 'RoCE v2' > "$sysfs/class/infiniband/mlx5_0/ports/2/gid_attrs/types/3"
+printf '%s\n' 'cx7_1' > "$sysfs/class/infiniband/mlx5_0/ports/2/gid_attrs/ndevs/3"
+SPARKRUN_SYSFS_ROOT="$sysfs"
+ip() { printf '%s\n' '10.0.0.2 dev cx7_1 src 10.0.0.1'; }
+"""
+    script = fixture + generate_roce_route_probe_script(["10.0.0.2"])
+    result = subprocess.run(["bash", "-s"], input=script.encode(), capture_output=True, timeout=10)
+
+    assert result.returncode == 0, result.stderr.decode()
+    assert result.stdout.decode().strip() == ("ROCE_ROUTE=10.0.0.2|10.0.0.1|cx7_1|mlx5_0|2|3|0000:0000:0000:0000:0000:ffff:0a00:0001")
+
+
+def test_roce_route_probe_emits_every_matching_port_for_a_peer():
+    fixture = r"""
+set -euo pipefail
+sysfs=$(mktemp -d)
+trap 'rm -rf "$sysfs"' EXIT
+mkdir -p "$sysfs/class/net/cx7_1/device/infiniband/mlx5_0"
+for port in 1 2; do
+    mkdir -p "$sysfs/class/infiniband/mlx5_0/ports/$port/gids"
+    mkdir -p "$sysfs/class/infiniband/mlx5_0/ports/$port/gid_attrs/types"
+    mkdir -p "$sysfs/class/infiniband/mlx5_0/ports/$port/gid_attrs/ndevs"
+    printf '%s\n' '0000:0000:0000:0000:0000:ffff:0a00:0001' > "$sysfs/class/infiniband/mlx5_0/ports/$port/gids/3"
+    printf '%s\n' 'RoCE v2' > "$sysfs/class/infiniband/mlx5_0/ports/$port/gid_attrs/types/3"
+    printf '%s\n' 'cx7_1' > "$sysfs/class/infiniband/mlx5_0/ports/$port/gid_attrs/ndevs/3"
+done
+SPARKRUN_SYSFS_ROOT="$sysfs"
+ip() { printf '%s\n' '10.0.0.2 dev cx7_1 src 10.0.0.1'; }
+"""
+    script = fixture + generate_roce_route_probe_script(["10.0.0.2"])
+    result = subprocess.run(["bash", "-s"], input=script.encode(), capture_output=True, timeout=10)
+
+    assert result.returncode == 0, result.stderr.decode()
+    assert result.stdout.decode().splitlines() == [
+        "ROCE_ROUTE=10.0.0.2|10.0.0.1|cx7_1|mlx5_0|1|3|0000:0000:0000:0000:0000:ffff:0a00:0001",
+        "ROCE_ROUTE=10.0.0.2|10.0.0.1|cx7_1|mlx5_0|2|3|0000:0000:0000:0000:0000:ffff:0a00:0001",
+    ]
+
+
+def test_route_matching_selects_gid_from_routed_hca_not_first_hca(caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="sparkrun.orchestration.infiniband")
+    ib_info = {
+        "IB_DETECTED": "1",
+        "DETECTED_GID_INDEX": "1",
+        "DETECTED_HCA_LIST": "mlx5_0,mlx5_1",
+        "DETECTED_NET_LIST": "cx7_0,cx7_1",
+        "DETECTED_IB_IPS": "192.168.3.1,192.168.4.1",
+        "DETECTED_UCX_LIST": "mlx5_0:1,mlx5_1:1",
+    }
+    route_output = "ROCE_ROUTE=192.168.4.2|192.168.4.1|cx7_1|mlx5_1|1|3|0000:0000:0000:0000:0000:ffff:c0a8:0401\n"
+
+    selected = apply_roce_route_info(ib_info, route_output)
+
+    assert selected["DETECTED_GID_INDEX"] == "3"
+    assert selected["DETECTED_HCA_LIST"] == "mlx5_1:1"
+    assert selected["DETECTED_NET_LIST"] == "cx7_1"
+    assert selected["DETECTED_IB_IPS"] == "192.168.4.1,192.168.3.1"
+    assert selected["DETECTED_UCX_LIST"] == "mlx5_1:1"
+    assert "detected HCA(s) without a peer-route match: mlx5_0" in caplog.text
+
+
+def test_route_matching_removes_ucx_devices_for_unselected_hcas():
+    selected = apply_roce_route_info(
+        {"IB_DETECTED": "1", "DETECTED_UCX_LIST": "mlx5_0:1"},
+        "ROCE_ROUTE=192.168.4.2|192.168.4.1|cx7_1|mlx5_1|1|3|0000:0000:0000:0000:0000:ffff:c0a8:0401\n",
+    )
+
+    assert selected["DETECTED_UCX_LIST"] == ""
+
+
+def test_route_matching_preserves_the_verified_hca_port():
+    selected = apply_roce_route_info(
+        {
+            "IB_DETECTED": "1",
+            "DETECTED_HCA_LIST": "mlx5_0",
+            "DETECTED_UCX_LIST": "mlx5_0:1,mlx5_0:2",
+        },
+        "ROCE_ROUTE=192.168.4.2|192.168.4.1|cx7_1|mlx5_0|2|3|0000:0000:0000:0000:0000:ffff:c0a8:0401\n",
+    )
+
+    env = generate_nccl_env(selected)
+    assert env["NCCL_IB_HCA"] == "=mlx5_0:2"
+    assert env["NCCL_IB_GID_INDEX"] == "3"
+    assert env["UCX_NET_DEVICES"] == "mlx5_0:2"
+
+
+def test_route_verified_nccl_hca_selector_uses_exact_match():
+    selected = apply_roce_route_info(
+        {"IB_DETECTED": "1", "DETECTED_HCA_LIST": "mlx5_1,mlx5_10"},
+        "ROCE_ROUTE=192.168.4.2|192.168.4.1|cx7_1|mlx5_1|1|3|0000:0000:0000:0000:0000:ffff:c0a8:0401\n",
+    )
+
+    env = generate_nccl_env(selected)
+    assert env["NCCL_IB_HCA"] == "=mlx5_1:1"
+    assert env.get("UCX_NET_DEVICES") is None
+
+
+def test_route_probe_outer_fanout_respects_max_workers(monkeypatch):
+    import threading
+    import time
+
+    from sparkrun.orchestration.infiniband import _probe_roce_routes_for_hosts
+    from sparkrun.orchestration.ssh import RemoteResult
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def fake_run(hosts, script, **kwargs):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+        host = hosts[0]
+        return [RemoteResult(host=host, returncode=0, stdout="", stderr="")]
+
+    monkeypatch.setattr("sparkrun.orchestration.ssh.run_remote_scripts_parallel", fake_run)
+    observations = {
+        "h1": {"IB_DETECTED": "1", "DETECTED_IB_IPS": "10.0.0.1"},
+        "h2": {"IB_DETECTED": "1", "DETECTED_IB_IPS": "10.0.0.2"},
+        "h3": {"IB_DETECTED": "1", "DETECTED_IB_IPS": "10.0.0.3"},
+        "h4": {"IB_DETECTED": "1", "DETECTED_IB_IPS": "10.0.0.4"},
+    }
+
+    _probe_roce_routes_for_hosts(["h1", "h2", "h3", "h4"], observations, {"max_workers": 1})
+
+    assert max_active == 1
+
+
+def test_route_matching_warns_when_no_ucx_device_matches_the_selected_port(caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="sparkrun.orchestration.infiniband")
+    selected = apply_roce_route_info(
+        {
+            "IB_DETECTED": "1",
+            "DETECTED_HCA_LIST": "mlx5_0",
+            "DETECTED_UCX_LIST": "mlx5_0:1",
+        },
+        "ROCE_ROUTE=192.168.4.2|192.168.4.1|cx7_1|mlx5_0|2|3|0000:0000:0000:0000:0000:ffff:c0a8:0401\n",
+    )
+
+    assert selected["DETECTED_HCA_LIST"] == "mlx5_0:2"
+    assert selected["DETECTED_UCX_LIST"] == ""
+    assert "No detected UCX device matches route-selected HCA ports mlx5_0:2" in caplog.text
+
+
+def test_route_matching_preserves_per_host_gid_indices():
+    head = apply_roce_route_info(
+        {"IB_DETECTED": "1", "DETECTED_HCA_LIST": "mlx5_0,mlx5_1"},
+        "ROCE_ROUTE=192.168.4.2|192.168.4.1|cx7_0|mlx5_0|1|3|0000:0000:0000:0000:0000:ffff:c0a8:0401\n",
+    )
+    worker = apply_roce_route_info(
+        {"IB_DETECTED": "1", "DETECTED_HCA_LIST": "mlx5_0,mlx5_1"},
+        "ROCE_ROUTE=192.168.4.1|192.168.4.2|cx7_1|mlx5_1|1|2|0000:0000:0000:0000:0000:ffff:c0a8:0402\n",
+    )
+
+    detected = ib_detection_from_observations(["head", "worker"], {"head": head, "worker": worker})
+
+    assert detected.comm_env.get_env("head")["NCCL_IB_GID_INDEX"] == "3"
+    assert detected.comm_env.get_env("head")["NCCL_IB_HCA"] == "=mlx5_0:1"
+    assert detected.comm_env.get_env("worker")["NCCL_IB_GID_INDEX"] == "2"
+    assert detected.comm_env.get_env("worker")["NCCL_IB_HCA"] == "=mlx5_1:1"
+
+
+def test_route_probe_runs_per_host_against_other_hosts_fabric_ips(monkeypatch):
+    hosts = ["head", "worker"]
+    observations = {
+        "head": {"IB_DETECTED": "1", "DETECTED_IB_IPS": "10.0.0.1", "DETECTED_GID_INDEX": "1"},
+        "worker": {"IB_DETECTED": "1", "DETECTED_IB_IPS": "10.0.0.2", "DETECTED_GID_INDEX": "1"},
+    }
+    route_output = {
+        "head": "ROCE_ROUTE=10.0.0.2|10.0.0.1|cx7_1|mlx5_1|1|3|0000:0000:0000:0000:0000:ffff:0a00:0001\n",
+        "worker": "ROCE_ROUTE=10.0.0.1|10.0.0.2|cx7_0|mlx5_0|1|2|0000:0000:0000:0000:0000:ffff:0a00:0002\n",
+    }
+    calls = {}
+
+    def fake_probe(targets, script, **kwargs):
+        host = targets[0]
+        calls[host] = script
+        return [RemoteResult(host=host, returncode=0, stdout=route_output[host], stderr="")]
+
+    monkeypatch.setattr("sparkrun.orchestration.ssh.run_remote_scripts_parallel", fake_probe)
+
+    enriched = enrich_ib_observations_with_roce_routes(hosts, observations)
+    detected = ib_detection_from_observations(hosts, enriched)
+
+    assert "SPARKRUN_PEER_IPS=10.0.0.2" in calls["head"]
+    assert "SPARKRUN_PEER_IPS=10.0.0.1" in calls["worker"]
+    assert detected.comm_env.get_env("head")["NCCL_IB_GID_INDEX"] == "3"
+    assert detected.comm_env.get_env("worker")["NCCL_IB_GID_INDEX"] == "2"
+    assert observations["head"]["DETECTED_GID_INDEX"] == "1"
+
+
+def test_hosts_without_peer_fabric_ips_do_not_keep_the_initial_gid_guess(monkeypatch):
+    hosts = ["head", "worker"]
+    observations = {
+        "head": {
+            "IB_DETECTED": "1",
+            "DETECTED_GID_INDEX": "1",
+            "DETECTED_IB_IPS": "10.0.0.1",
+            "DETECTED_HCA_LIST": "mlx5_0:1",
+            "DETECTED_NET_LIST": "cx7_0",
+            "DETECTED_UCX_LIST": "mlx5_0:1",
+        },
+        "worker": {
+            "IB_DETECTED": "1",
+            "DETECTED_GID_INDEX": "2",
+            "DETECTED_IB_IPS": "",
+            "DETECTED_HCA_LIST": "mlx5_1:1",
+            "DETECTED_NET_LIST": "cx7_1",
+            "DETECTED_UCX_LIST": "mlx5_1:1",
+        },
+    }
+    probed_hosts = []
+
+    def fake_probe(targets, script, **kwargs):
+        probed_hosts.append(targets[0])
+        return [RemoteResult(host=targets[0], returncode=0, stdout="", stderr="")]
+
+    monkeypatch.setattr("sparkrun.orchestration.ssh.run_remote_scripts_parallel", fake_probe)
+
+    enriched = enrich_ib_observations_with_roce_routes(hosts, observations)
+
+    assert set(probed_hosts) == {"worker"}
+    assert enriched["head"]["DETECTED_GID_INDEX"] == "-1"
+    assert enriched["worker"]["DETECTED_GID_INDEX"] == "-1"
+    assert enriched["head"].get("DETECTED_HCA_LIST", "") == ""
+    assert enriched["worker"].get("DETECTED_HCA_LIST", "") == ""
+    for host in hosts:
+        assert enriched[host]["DETECTED_NET_LIST"] == ""
+        assert enriched[host]["DETECTED_UCX_LIST"] == ""
+
+
+def test_route_probe_workers_inherit_operation_context(monkeypatch):
+    from sparkrun.core.operation import CURRENT, OperationState
+
+    state = OperationState(id="route-probe-test")
+    observed = []
+
+    def fake_probe(targets, script, **kwargs):
+        observed.append(CURRENT.get())
+        return [RemoteResult(host=targets[0], returncode=0, stdout="", stderr="")]
+
+    monkeypatch.setattr("sparkrun.orchestration.ssh.run_remote_scripts_parallel", fake_probe)
+    token = CURRENT.set(state)
+    try:
+        enrich_ib_observations_with_roce_routes(
+            ["head", "worker"],
+            {
+                "head": {"IB_DETECTED": "1", "DETECTED_IB_IPS": "10.0.0.1"},
+                "worker": {"IB_DETECTED": "1", "DETECTED_IB_IPS": "10.0.0.2"},
+            },
+        )
+    finally:
+        CURRENT.reset(token)
+
+    assert len(observed) == 2
+    assert all(operation is state for operation in observed)
+
+
+def test_route_matching_uses_nccl_auto_when_routes_need_different_indices():
+    ib_info = {"IB_DETECTED": "1", "DETECTED_HCA_LIST": "mlx5_0,mlx5_1"}
+    route_output = (
+        "ROCE_ROUTE=192.168.4.2|192.168.4.1|cx7_0|mlx5_0|1|3|"
+        "0000:0000:0000:0000:0000:ffff:c0a8:0401\n"
+        "ROCE_ROUTE=192.168.5.2|192.168.5.1|cx7_1|mlx5_1|1|2|"
+        "0000:0000:0000:0000:0000:ffff:c0a8:0501\n"
+    )
+
+    selected = apply_roce_route_info(ib_info, route_output)
+
+    assert selected["DETECTED_GID_INDEX"] == "-1"
+    assert selected["DETECTED_HCA_LIST"] == "mlx5_0:1,mlx5_1:1"
+
+
+def test_route_probe_without_valid_roce_link_uses_nccl_auto():
+    ib_info = {
+        "IB_DETECTED": "1",
+        "DETECTED_GID_INDEX": "1",
+        "DETECTED_HCA_LIST": "mlx5_0:1",
+        "DETECTED_NET_LIST": "cx7_0",
+        "DETECTED_UCX_LIST": "mlx5_0:1",
+    }
+
+    selected = apply_roce_route_info(ib_info, "")
+
+    assert selected["DETECTED_GID_INDEX"] == "-1"
+    assert selected["DETECTED_HCA_LIST"] == ""
+    assert selected["DETECTED_NET_LIST"] == ""
+    assert selected["DETECTED_UCX_LIST"] == ""
+    env = generate_nccl_env(selected)
+    assert "NCCL_IB_HCA" not in env
+    assert "UCX_NET_DEVICES" not in env
+
+
+def test_route_probe_allow_local_in_ssh_kwargs_is_not_passed_twice(monkeypatch):
+    from sparkrun.orchestration.infiniband import _probe_roce_routes_for_hosts
+
+    calls = []
+
+    def fake_run(hosts, script, **kwargs):
+        calls.append((hosts, kwargs))
+        return [RemoteResult(host=hosts[0], returncode=0, stdout="", stderr="")]
+
+    monkeypatch.setattr("sparkrun.orchestration.ssh.run_remote_scripts_parallel", fake_run)
+    observations = {
+        "head": {"IB_DETECTED": "1", "DETECTED_IB_IPS": "10.0.0.1"},
+        "worker": {"IB_DETECTED": "1", "DETECTED_IB_IPS": "10.0.0.2"},
+    }
+
+    result = _probe_roce_routes_for_hosts(["head", "worker"], observations, {"allow_local": True})
+
+    assert set(result) == {"head", "worker"}
+    assert len(calls) == 2
+    assert all(kwargs["allow_local"] is True for _, kwargs in calls)
+
+
+def test_route_probe_defaults_to_local_dispatch(monkeypatch):
+    from sparkrun.orchestration.infiniband import _probe_roce_routes_for_hosts
+
+    calls = []
+
+    def fake_run(hosts, script, **kwargs):
+        calls.append((hosts, kwargs))
+        return [RemoteResult(host=hosts[0], returncode=0, stdout="", stderr="")]
+
+    monkeypatch.setattr("sparkrun.orchestration.ssh.run_remote_scripts_parallel", fake_run)
+    observations = {
+        "head": {"IB_DETECTED": "1", "DETECTED_IB_IPS": "10.0.0.1"},
+        "worker": {"IB_DETECTED": "1", "DETECTED_IB_IPS": "10.0.0.2"},
+    }
+
+    _probe_roce_routes_for_hosts(["head", "worker"], observations, {})
+
+    assert len(calls) == 2
+    assert all(kwargs["allow_local"] is True for _, kwargs in calls)
+
+
+def test_parse_roce_route_output_ignores_malformed_rows():
+    parsed = parse_roce_route_output(
+        "ROCE_ROUTE=192.168.4.2|192.168.4.1|cx7_1|mlx5_1|1|3|"
+        "0000:0000:0000:0000:0000:ffff:c0a8:0401\n"
+        "ROCE_ROUTE=192.168.4.2|192.168.4.1|cx7_1|mlx5_1|1|3|"
+        "0000:0000:0000:0000:0000:ffff:c0a8:0402\n"
+        "ROCE_ROUTE=not-an-ip|bad|lo|mlx5_1|1|x|not-a-gid\n"
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0]["hca"] == "mlx5_1"
+    assert parsed[0]["port"] == "1"
+    assert parsed[0]["gid_index"] == "3"
 
 
 def test_generate_nccl_env_with_ib():
@@ -743,15 +1200,25 @@ def test_combined_observations_produce_the_same_network_settings_as_standalone_p
             "DETECTED_MGMT_IP": "10.0.0.2",
         },
     }
-    monkeypatch.setattr(
-        "sparkrun.orchestration.ssh.run_remote_scripts_parallel",
-        lambda *a, **kw: [
+
+    def fake_run(hosts, script, **kwargs):
+        if "SPARKRUN_PEER_IPS" in script:
+            host = hosts[0]
+            routes = {
+                "h1": ("ROCE_ROUTE=192.168.1.2|192.168.1.1|roce0|mlx5_0|1|3|0000:0000:0000:0000:0000:ffff:c0a8:0101\n"),
+                "h2": ("ROCE_ROUTE=192.168.1.1|192.168.1.2|roce2|mlx5_1|1|3|0000:0000:0000:0000:0000:ffff:c0a8:0102\n"),
+            }
+            return [RemoteResult(host=host, returncode=0, stdout=routes[host], stderr="")]
+        return [
             RemoteResult(host=h, returncode=0, stdout="\n".join(k + "=" + v for k, v in info.items()), stderr="")
             for h, info in reversed(list(observations.items()))
-        ],
-    )
-    standalone = detect_ib_for_hosts(["h1", "h2"], topology="ring")
-    combined = ib_detection_from_observations(["h1", "h2"], observations, topology="ring")
+        ]
+
+    monkeypatch.setattr("sparkrun.orchestration.ssh.run_remote_scripts_parallel", fake_run)
+    hosts = ["h1", "h2"]
+    standalone = detect_ib_for_hosts(hosts, topology="ring")
+    enriched = enrich_ib_observations_with_roce_routes(hosts, observations)
+    combined = ib_detection_from_observations(hosts, enriched, topology="ring")
     assert standalone == combined
     assert combined.ib_candidates["h1"] == ["192.168.1.1", "192.168.2.1"]
     assert combined.comm_env.get_env("h2")["NCCL_SOCKET_IFNAME"].startswith("mgmt1")

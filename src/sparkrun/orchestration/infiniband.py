@@ -7,10 +7,13 @@ via SSH bash -s.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from sparkrun.core.operation import submit as _operation_submit
 from sparkrun.orchestration.comm_env import ClusterCommEnv
 from sparkrun.scripts import inject_shell_vars, read_script
 from sparkrun.utils import parse_kv_output
@@ -85,7 +88,7 @@ def generate_ib_detect_script(mgmt_interface: str | None = None) -> str:
     Output variables (if IB is found)::
 
         DETECTED_GID_INDEX=<n>    (-1 = let NCCL choose; see scripts/_gid_index.sh)
-        DETECTED_HCA_LIST=<comma-separated HCA names>
+        DETECTED_HCA_LIST=<comma-separated HCA[:port] identifiers>
         DETECTED_SOCKET_IFNAME=<interface>
         DETECTED_NET_LIST=<comma-separated net interfaces>
         DETECTED_UCX_LIST=<comma-separated UCX devices>
@@ -123,6 +126,146 @@ def parse_ib_detect_output(output: str) -> dict[str, str]:
         Dictionary of detected key=value pairs.
     """
     return parse_kv_output(output)
+
+
+def generate_roce_route_probe_script(peer_ips: list[str]) -> str:
+    """Generate a route-aware RoCE probe for the supplied peer fabric IPs.
+
+    Each candidate is validated as IPv4 before it is shell-quoted and passed
+    to the probe. The script resolves ``ip route get`` per peer and reports
+    only exact source-address-matched RoCEv2 GIDs on the routed HCA.
+    """
+    peers: list[str] = []
+    for peer_ip in peer_ips:
+        try:
+            normalized = str(ipaddress.IPv4Address(peer_ip))
+        except ipaddress.AddressValueError:
+            logger.debug("Skipping non-IPv4 RoCE peer candidate %r", peer_ip)
+            continue
+        if normalized not in peers:
+            peers.append(normalized)
+    script = read_script("roce_route_probe.sh").replace("\r\n", "\n")
+    return inject_shell_vars(script, SPARKRUN_PEER_IPS=",".join(peers))
+
+
+def parse_roce_route_output(output: str) -> list[dict[str, str]]:
+    """Parse route-probe rows, discarding malformed or unsafe values."""
+    routes: list[dict[str, str]] = []
+    seen: set[tuple[str, ...]] = set()
+    gid_pattern = re.compile(r"(?:[0-9a-fA-F]{4}:){7}[0-9a-fA-F]{4}")
+    name_pattern = re.compile(r"[A-Za-z0-9_.:-]+")
+    for line in output.splitlines():
+        key, separator, value = line.strip().partition("=")
+        if not separator or key != "ROCE_ROUTE":
+            continue
+        parts = value.split("|")
+        if len(parts) != 7:
+            continue
+        peer_ip, source_ip, netdev, hca, port, gid_index, gid = parts
+        try:
+            peer_ip = str(ipaddress.IPv4Address(peer_ip))
+            source_ip = str(ipaddress.IPv4Address(source_ip))
+        except ipaddress.AddressValueError:
+            continue
+        if not name_pattern.fullmatch(netdev) or not name_pattern.fullmatch(hca):
+            continue
+        if not port.isdigit() or int(port) < 1 or not gid_index.isdigit() or not gid_pattern.fullmatch(gid):
+            continue
+        octets = ipaddress.IPv4Address(source_ip).packed
+        expected_gid = "0000:0000:0000:0000:0000:ffff:%02x%02x:%02x%02x" % tuple(octets)
+        if gid.lower() != expected_gid:
+            continue
+        record = (peer_ip, source_ip, netdev, hca, port, gid_index, gid.lower())
+        if record in seen:
+            continue
+        seen.add(record)
+        routes.append(
+            {
+                "peer_ip": peer_ip,
+                "source_ip": source_ip,
+                "netdev": netdev,
+                "hca": hca,
+                "port": port,
+                "gid_index": gid_index,
+                "gid": gid.lower(),
+            }
+        )
+    return routes
+
+
+def apply_roce_route_info(ib_info: dict[str, str], route_output: str) -> dict[str, str]:
+    """Return *ib_info* with route-verified HCA/GID/interface selections.
+
+    A route-derived GID index is safe to pin only when all selected routed
+    HCAs use the same index. If indices differ—or no exact route/GID match is
+    available—use NCCL's ``-1`` auto-selection instead of retaining a guess
+    from the first active HCA.
+    """
+    updated = dict(ib_info)
+    if updated.get("IB_DETECTED") != "1":
+        return updated
+
+    routes = parse_roce_route_output(route_output)
+    if not routes:
+        updated["DETECTED_GID_INDEX"] = "-1"
+        updated["DETECTED_HCA_LIST"] = ""
+        updated.pop("DETECTED_HCA_LIST_EXACT", None)
+        updated["DETECTED_NET_LIST"] = ""
+        updated["DETECTED_UCX_LIST"] = ""
+        logger.warning("No route-matched RoCEv2 GID; leaving HCA, interface, and GID selection to runtime")
+        return updated
+
+    def unique_in_order(values: list[str]) -> list[str]:
+        return list(dict.fromkeys(values))
+
+    hca_ports = unique_in_order([f"{route['hca']}:{route['port']}" for route in routes])
+    netdevs = unique_in_order([route["netdev"] for route in routes])
+    gid_indices = unique_in_order([route["gid_index"] for route in routes])
+    detected_hcas = {entry.strip().split(":", 1)[0] for entry in updated.get("DETECTED_HCA_LIST", "").split(",") if entry.strip()}
+    routed_hcas = {route["hca"] for route in routes}
+    unmatched_hcas = sorted(detected_hcas - routed_hcas)
+    if unmatched_hcas:
+        logger.warning(
+            "Route-aware RoCE pins only peer-route-confirmed HCA ports %s; detected HCA(s) without a peer-route match: %s",
+            ", ".join(hca_ports),
+            ", ".join(unmatched_hcas),
+        )
+    updated["DETECTED_HCA_LIST"] = ",".join(hca_ports)
+    updated["DETECTED_HCA_LIST_EXACT"] = "1"
+    updated["DETECTED_NET_LIST"] = ",".join(netdevs)
+    updated["DETECTED_GID_INDEX"] = gid_indices[0] if len(gid_indices) == 1 else "-1"
+    original_ips = [ip.strip() for ip in updated.get("DETECTED_IB_IPS", "").split(",") if ip.strip()]
+    route_sources = unique_in_order([route["source_ip"] for route in routes])
+    updated["DETECTED_IB_IPS"] = ",".join(route_sources + [ip for ip in original_ips if ip not in route_sources])
+
+    selected_ports = set(hca_ports)
+    detected_ucx_devices = [device.strip() for device in updated.get("DETECTED_UCX_LIST", "").split(",") if device.strip()]
+    ucx_devices = [device for device in detected_ucx_devices if device in selected_ports]
+    if "DETECTED_UCX_LIST" in updated:
+        updated["DETECTED_UCX_LIST"] = ",".join(ucx_devices)
+        if detected_ucx_devices and not ucx_devices:
+            logger.warning(
+                "No detected UCX device matches route-selected HCA ports %s; leaving UCX device selection to runtime",
+                ", ".join(hca_ports),
+            )
+
+    for route in routes:
+        logger.debug(
+            "Route-aware RoCE: peer=%s source=%s interface=%s hca=%s port=%s gid=%s index=%s",
+            route["peer_ip"],
+            route["source_ip"],
+            route["netdev"],
+            route["hca"],
+            route["port"],
+            route["gid"],
+            route["gid_index"],
+        )
+    if len(gid_indices) > 1:
+        logger.warning(
+            "Route-matched RoCE links require different GID indices (%s); using NCCL auto-selection",
+            ", ".join(gid_indices),
+        )
+    return updated
 
 
 #: Every env var :func:`generate_nccl_env` (plus its ring-topology and
@@ -234,7 +377,10 @@ def generate_nccl_env(ib_info: dict[str, str], topology: str | None = None) -> d
         return ",".join(parts)
 
     if ib_info.get("DETECTED_HCA_LIST"):
-        env["NCCL_IB_HCA"] = ib_info["DETECTED_HCA_LIST"]
+        hca_list = ib_info["DETECTED_HCA_LIST"]
+        if ib_info.get("DETECTED_HCA_LIST_EXACT") == "1":
+            hca_list = ",".join(f"={hca.strip()}" for hca in hca_list.split(",") if hca.strip())
+        env["NCCL_IB_HCA"] = hca_list
     if ib_info.get("DETECTED_SOCKET_IFNAME"):  # prefer MGMT/default interface for non-IB HCA adapters since it works for mesh or non-mesh
         _set_eth_interfaces("DETECTED_SOCKET_IFNAME")
         env["NCCL_SOCKET_IFNAME"] = _nccl_socket_ifname_list(
@@ -506,7 +652,107 @@ def detect_ib_for_hosts(
     )
 
     observations = {result.host: parse_ib_detect_output(result.stdout) for result in ib_results if result.success}
+    observations = enrich_ib_observations_with_roce_routes(hosts, observations, ssh_kwargs=kw, dry_run=dry_run)
     return ib_detection_from_observations(hosts, observations, topology=topology, backends=backends)
+
+
+def enrich_ib_observations_with_roce_routes(
+    hosts: list[str],
+    observations: dict[str, dict[str, str]],
+    *,
+    ssh_kwargs: dict | None = None,
+    dry_run: bool = False,
+    allow_local: bool = True,
+) -> dict[str, dict[str, str]]:
+    """Augment multi-host IB observations with each host's peer-route GID.
+
+    The initial inventory probe has no peer context. This second phase uses
+    the discovered fabric addresses to resolve each host's actual route and
+    then matches that route's local source address to a RoCEv2 GID. The input
+    observations are not mutated.
+    """
+    enriched = {host: dict(info) for host, info in observations.items()}
+    if dry_run or len(hosts) < 2:
+        return enriched
+
+    # The first-pass detector's index is only a candidate. In a multi-host
+    # launch, discard it until a peer route proves a local HCA/GID match.
+    for info in enriched.values():
+        if info.get("IB_DETECTED") == "1":
+            info["DETECTED_GID_INDEX"] = "-1"
+
+    route_outputs = _probe_roce_routes_for_hosts(hosts, enriched, ssh_kwargs or {}, allow_local=allow_local)
+    for host in hosts:
+        if host in enriched and enriched[host].get("IB_DETECTED") == "1":
+            enriched[host] = apply_roce_route_info(enriched[host], route_outputs.get(host, ""))
+    return enriched
+
+
+def _probe_roce_routes_for_hosts(
+    hosts: list[str], observations: dict[str, dict[str, str]], ssh_kwargs: dict, *, allow_local: bool = True
+) -> dict[str, str]:
+    """Probe each host's route to the other hosts' discovered fabric IPs."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from sparkrun.orchestration.ssh import resolve_parallel_cap, run_remote_scripts_parallel
+
+    targets: list[tuple[str, list[str]]] = []
+    for host in hosts:
+        if observations.get(host, {}).get("IB_DETECTED") != "1":
+            continue
+        peer_ips: list[str] = []
+        for peer_host in hosts:
+            if peer_host == host:
+                continue
+            for peer_ip in extract_ib_ips(observations.get(peer_host, {})):
+                try:
+                    normalized = str(ipaddress.IPv4Address(peer_ip))
+                except ipaddress.AddressValueError:
+                    continue
+                if normalized not in peer_ips:
+                    peer_ips.append(normalized)
+        if peer_ips:
+            targets.append((host, peer_ips))
+        else:
+            logger.warning(
+                "No peer fabric IPv4 candidates for %s; using NCCL GID auto-selection",
+                host,
+            )
+
+    if not targets:
+        return {}
+
+    def _probe(target: tuple[str, list[str]]) -> tuple[str, str]:
+        host, peer_ips = target
+        script = generate_roce_route_probe_script(peer_ips)
+        route_ssh_kwargs = dict(ssh_kwargs)
+        route_allow_local = route_ssh_kwargs.pop("allow_local", allow_local)
+        try:
+            results = run_remote_scripts_parallel(
+                [host],
+                script,
+                timeout=15,
+                dry_run=False,
+                allow_local=route_allow_local,
+                **route_ssh_kwargs,
+            )
+        except Exception as exc:  # Keep network discovery useful if the optional probe fails.
+            logger.warning("Route-aware RoCE probe failed on %s: %s", host, exc)
+            return host, ""
+        if not results or not results[0].success:
+            detail = results[0].stderr.strip() if results else "no result returned"
+            logger.warning("Route-aware RoCE probe failed on %s: %s", host, detail or "remote probe failed")
+            return host, ""
+        return host, results[0].stdout
+
+    route_outputs: dict[str, str] = {}
+    max_workers = ssh_kwargs.get("max_workers")
+    with ThreadPoolExecutor(max_workers=resolve_parallel_cap(len(targets), max_workers)) as pool:
+        futures = [_operation_submit(pool, _probe, target) for target in targets]
+        for future in as_completed(futures):
+            host, output = future.result()
+            route_outputs[host] = output
+    return route_outputs
 
 
 def ib_detection_from_observations(

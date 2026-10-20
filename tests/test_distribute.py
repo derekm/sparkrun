@@ -1390,7 +1390,7 @@ class TestDetectIbForHosts:
     @mock.patch("sparkrun.orchestration.ssh.run_remote_scripts_parallel")
     def test_returns_nccl_env_from_head(self, mock_parallel):
         """NCCL env is derived from the head host's detection."""
-        mock_parallel.return_value = [
+        initial_results = [
             RemoteResult(
                 host="h1",
                 returncode=0,
@@ -1404,6 +1404,18 @@ class TestDetectIbForHosts:
                 stderr="",
             ),
         ]
+
+        def fake_parallel(hosts, script, **kwargs):
+            if "SPARKRUN_PEER_IPS" not in script:
+                return initial_results
+            host = hosts[0]
+            route = {
+                "h1": "ROCE_ROUTE=10.0.0.2|10.0.0.1|ib0|mlx5_0|1|3|0000:0000:0000:0000:0000:ffff:0a00:0001\n",
+                "h2": "ROCE_ROUTE=10.0.0.1|10.0.0.2|ib0|mlx5_0|1|3|0000:0000:0000:0000:0000:ffff:0a00:0002\n",
+            }[host]
+            return [RemoteResult(host=host, returncode=0, stdout=route, stderr="")]
+
+        mock_parallel.side_effect = fake_parallel
         from sparkrun.orchestration.infiniband import detect_ib_for_hosts
 
         result = detect_ib_for_hosts(["h1", "h2"])
